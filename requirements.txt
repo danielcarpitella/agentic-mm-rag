@@ -1,0 +1,9 @@
+mlx-vlm==0.6.16
+transformers==5.15.1
+faiss-cpu==1.15.0
+pillow==12.3.0
+pyyaml==6.0.3
+numpy==2.5.2
+jinja2==3.1.6
+requests==2.34.2
+torch==2.13.0
