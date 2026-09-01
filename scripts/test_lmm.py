@@ -1,9 +1,10 @@
 """Phase 1 test script: one local image + "describe this image."
 
-Usage: python scripts/test_lmm.py   (run from the project root)
+Usage: python scripts/test_lmm.py [--config CONFIG]   (run from the project root)
 Checks the Phase 1 definition of done: a sensible description in < ~30s.
 """
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,11 @@ TEST_IMAGE = Path(__file__).parent / "test_assets" / "test_bicycle.jpg"
 
 
 def main() -> None:
-    cfg = load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    project_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=project_root / "config.yaml", type=Path)
+    args = parser.parse_args()
+    cfg = load_config(args.config)
 
     print(f"Loading model {cfg.model.name} (backend={cfg.model.backend})...")
     t0 = time.time()

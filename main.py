@@ -15,11 +15,12 @@ from src.retriever import Retriever
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser() 
-    parser.add_argument("question") 
-    args = parser.parse_args() # args contains the command-line arguments, including the user's question
+    parser = argparse.ArgumentParser()
+    parser.add_argument("question")
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
 
-    cfg = load_config("config.yaml")
+    cfg = load_config(args.config)
     orchestrator = Orchestrator(
         lmm=LMM(cfg.model),
         retriever=Retriever(cfg.retriever),

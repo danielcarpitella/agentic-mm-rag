@@ -1,0 +1,20 @@
+model:
+  name: "Qwen/Qwen2-VL-2B-Instruct"
+  backend: "transformers-cuda"
+  max_new_tokens: 256
+  temperature: 0.2
+
+retriever:
+  encoder: "openai/clip-vit-base-patch32"
+  index_backend: "faiss"
+  index_dir: "index/"
+  top_k: 1
+  mode: "text2image"
+
+orchestrator:
+  max_steps: 4
+  max_images_in_context: 2
+
+data:
+  images_dir: "data/images"
+  metadata: "data/metadata.jsonl"

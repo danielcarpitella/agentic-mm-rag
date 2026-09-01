@@ -1,5 +1,9 @@
 # ARCHITECTURE.md — Agentic Multimodal RAG: how the system works
 
+> **Context warning:** this document describes the intended architecture but may
+> lag behind the implementation. If it conflicts with the current code or leaves
+> an important point ambiguous, inspect the code and ask Daniel for clarification.
+
 > This file explains the theory and structure of the system. It helps me (the student)
 > understand and explain each component. It does not contain operational setup instructions:
 > those are in the repository README.
@@ -27,6 +31,7 @@ generation, but is **decided by the model, during reasoning, even multiple times
                                           ▼
                                  ┌──────────────────┐
                                  │   LMM (frozen)    │  e.g. Qwen2-VL-2B via MLX
+                                 │                   │  or Transformers/CUDA
                                  │                   │  emits text; sometimes contains
                                  └────────┬─────────┘  the SEARCH("...") trigger
                                           │
@@ -48,6 +53,9 @@ generation, but is **decided by the model, during reasoning, even multiple times
 
 - Small (2B), open-weight model, run locally. No training, no fine-tuning:
 all behavior is achieved through **prompting**.
+- The `LMM` wrapper selects the local runtime: MLX on Apple Silicon or
+  Transformers/CUDA on Windows with an NVIDIA GPU. Its `generate(messages)`
+  interface remains the same for the rest of the system.
 - Why small: (a) it runs on my hardware; (b) it has real knowledge gaps, so
 retrieval is genuinely needed and its effect is measurable; (c) orchestration matters,
 and the model does not compensate for our errors.
@@ -244,12 +252,12 @@ iteration on the prompt is expected. → record everything in NOTES.md.
 
 | Choice            | Prototype default             | Ready alternatives                      |
 | ----------------- | ----------------------------- | --------------------------------------- |
-| LMM               | Qwen2-VL-2B (4-bit, MLX)      | SmolVLM, LLaVA; 7B if we have a GPU     |
-| Runtime           | MLX-VLM (Apple Silicon)       | transformers + MPS; transformers + CUDA |
+| LMM               | Qwen2-VL-2B (4-bit)           | SmolVLM, LLaVA; 7B if we have a GPU     |
+| Runtime           | MLX (Mac) / Transformers CUDA (Windows NVIDIA) | transformers + MPS |
 | Index             | FAISS (faiss-cpu)             | ChromaDB                                |
 | Retrieval encoder | CLIP ViT-B/32                 | SigLIP                                  |
 | Search            | text→image embedding only     | caption text→text; hybrid               |
-| Dataset domain    | (to be decided, 1 domain)     | —                                       |
+| Dataset domain    | World landmarks (prototype)   | To be decided for the final dataset     |
 
 
 All these choices are isolated behind `config.yaml` + wrapper classes,
