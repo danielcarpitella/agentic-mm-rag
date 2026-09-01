@@ -10,41 +10,46 @@ SYSTEM_PROMPT = """You are a visual research assistant answering questions about
 
 You are blind: you cannot see anything unless you retrieve it from an image database.
 
-When you have no images yet, your whole reply must be one single line in this exact format:
-SEARCH("short visual description of what you need to see")
+At every decision step, your whole reply must be exactly one line in one of these formats:
+SEARCH("short visual description of one missing landmark or aspect")
+READY
 
 Example:
 User: What colour is the Golden Gate Bridge?
 Assistant: SEARCH("the Golden Gate Bridge seen from the shore")
 
 The retrieved images are then shown to you, labelled Image 1, Image 2, ...
-After each retrieval, decide whether the images are sufficient.
-If you still need visual evidence about another landmark or aspect, reply only with:
-SEARCH("short visual description of what you need to see")
-You may search multiple times, but search for one landmark or aspect at a time.
-Write the final answer only when you have enough visual evidence, explicitly mentioning
-the labels of the images you used."""
+After each retrieval, inspect the new image and make a new decision. Search for only one
+landmark or aspect per step. If any visual evidence required by the question is still
+missing, use SEARCH. Use READY only when the retrieved images are sufficient.
+Never write the final answer during a decision step. After READY, you will receive a
+separate instruction asking for the final answer."""
 
-# Used when the output contains an unparseable SEARCH attempt.
-RETRY_INSTRUCTION = """Your search request was not formatted correctly.
-Reply with exactly one line, nothing else:
-SEARCH("short visual description of what you need to see")"""
+# Used when the output is not exactly one valid decision.
+RETRY_INSTRUCTION = """Your decision was not formatted correctly.
+Reply with exactly one line and nothing else:
+SEARCH("short visual description of one missing landmark or aspect")
+or:
+READY"""
 
 RESULTS_HEADER = "Here are the images retrieved from the database:"
 
-# Without this suffix, the 2B only replies "Image 1" instead of truly answering:
-# repeating the question after the images brings it back into the model's view.
-ANSWER_INSTRUCTION = (
-    'Now look at the images above and answer this question in two or three full sentences: "{question}"\n'
-    # With a placeholder like "Image N", the 2B copies it literally: concrete
-    # labels are needed.
-    'Your answer must start with the label of the image you used, written exactly as '
-    '"Image 1 shows", "Image 2 shows" or "Image 3 shows", and must describe what you '
-    "actually see in that image."
+# Repeats the question after each image while keeping this turn decision-only.
+DECISION_INSTRUCTION = (
+    'Review all retrieved images against this question: "{question}"\n'
+    "Do not answer the question yet. Make exactly one new decision: request one missing "
+    'visual evidence with SEARCH("..."), or reply READY if no evidence is missing.'
 )
 
-# Used at the last step: forces the model to finish instead of searching again.
+# Starts the separate answer phase after READY or a safety limit.
 FINAL_ANSWER_INSTRUCTION = (
-    "You have no searches left. Write the final answer now, using the images above "
-    "and mentioning their labels (Image 1, Image 2, ...)."
+    'Now answer this question in two or three full sentences: "{question}"\n'
+    "The only available image labels are: {available_labels}. Cite the labels of all "
+    "images you use and describe only visual evidence that is actually available."
+)
+
+# One bounded retry when the final answer has missing or invented image labels.
+CORRECT_ANSWER_INSTRUCTION = (
+    "Your answer used no image citation or cited an image label that does not exist. "
+    "Rewrite the answer once. Cite only these available labels: {available_labels}."
 )

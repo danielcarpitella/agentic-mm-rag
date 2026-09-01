@@ -85,17 +85,21 @@ CLIP space and the LMM space (building one would require a trained module — ou
 ```python
 context = system_prompt + question
 for step in range(MAX_STEPS):
-    output = lmm.generate(context)
-    trigger = extract_search(output)        # regex on SEARCH("...")
-    if trigger is None:
-        return output                       # final answer
-    results = retriever.search(trigger, k=K)   # → [{image_path, caption, id}]
-    context = update_context(context, output, results)
-return fallback()                           # iteration limit reached
+    decision = lmm.generate(context)        # exactly one SEARCH(...) or READY
+    if decision == READY:
+        answer = lmm.generate(final_instruction)
+        return validate_image_citations(answer)
+    query = extract_first_search(decision)
+    result = retriever.search(query, k=1)
+    context = add_executed_search_and_image(context, query, result)
+return forced_grounded_answer()
 ```
 
 - No agentic frameworks (LangChain, etc.): the loop IS the project's contribution,
 and small models require full control over the literal prompt.
+- Architectural invariant: the orchestrator executes at most one retrieval per
+model turn, then returns the result to the model for a new decision. Extra
+`SEARCH(...)` text in the same output is not queued or executed automatically.
 
 
 
@@ -152,16 +156,17 @@ are saved as metadata: we neither calculate nor save embeddings for them. This c
 corresponds to `text2image` mode: a text query searches directly for images
 in CLIP's shared space.
 
-### 3.2 Runtime: one question, one loop iteration
+### 3.2 Runtime: one question, iterative decisions
 
 ```mermaid
 flowchart TD
     Question["User question"]
     Context["System prompt + question"]
     LMM["Frozen LMM"]
-    Output["Text output"]
-    Search{"SEARCH(...)?"}
+    Decision["One decision"]
+    Search{"SEARCH(...) or READY?"}
     Final["Final answer"]
+    Validate{"Valid image labels?"}
     Query["Extracted text query"]
     ClipText["CLIP text encoder"]
     QueryEmbedding["CLIP query embedding"]
@@ -169,9 +174,11 @@ flowchart TD
     Hits["ID → image + caption"]
     NewContext["Context updated with Image 1, Image 2, ..."]
 
-    Question --> Context --> LMM --> Output --> Search
-    Search -->|no| Final
-    Search -->|yes| Query --> ClipText --> QueryEmbedding --> Faiss --> Hits --> NewContext --> LMM
+    Question --> Context --> LMM --> Decision --> Search
+    Search -->|READY| Final --> Validate
+    Search -->|SEARCH| Query --> ClipText --> QueryEmbedding --> Faiss --> Hits --> NewContext --> LMM
+    Validate -->|yes| Accepted["Accepted answer"]
+    Validate -->|"no, one correction"| Final
 ```
 
 
@@ -179,18 +186,22 @@ flowchart TD
 In order:
 
 1. The LMM receives the question and the system prompt.
-2. If it needs visual evidence, it produces text in the format
-  `SEARCH("visual description")`. This is not native tool calling: it is a textual
-   convention interpreted by our code.
+2. At each decision step it emits exactly one `SEARCH("visual description")`,
+   or `READY` when the accumulated evidence is sufficient. It does not answer
+   during this step. This is not native tool calling: it is a textual convention
+   interpreted by our code.
 3. The orchestrator extracts the description from the text with a regex.
 4. The retriever passes that description to the **CLIP text encoder** and obtains a
   query embedding.
 5. FAISS compares the query embedding with the image embeddings and returns
   the most similar positions.
 6. From the results, the retriever obtains the ID, image path, and associated caption.
-7. The orchestrator inserts the actual images, captions, and labels
-  `Image 1`, `Image 2`, etc. into the context; it then calls the LMM again.
-8. The LMM inspects the images and generates an answer that cites the images used.
+7. The orchestrator inserts the actual image, caption, and next `Image N` label
+   into the context, then calls the LMM for a new decision. Only the first search
+   from a turn is executed, so every retrieval is followed by a fresh inspection.
+8. When the model emits `READY`, the orchestrator starts a separate answer turn.
+   It accepts the answer only if it cites existing image labels; otherwise it
+   requests one correction.
 
 
 
@@ -231,17 +242,20 @@ automatically transforms it into the necessary tokens.
 ## 4. The trigger format (LMM ↔ orchestrator protocol)
 
 The model does not have native tool calling: the "protocol" is plain text, defined in the
-system prompt. Initial convention:
+system prompt. Current decisions:
 
 ```
-SEARCH("visual description of what is needed")
+SEARCH("visual description of one missing evidence")
+READY
 ```
 
-- The system prompt tells the model: "if you lack visual evidence, write
-SEARCH(...) and stop."
+- The system prompt tells the model to output one decision and stop: use
+  `SEARCH(...)` for one missing visual evidence, or `READY` when none is missing.
 - The orchestrator extracts the query with a regex. If the format is incorrect but
 recognizable, it attempts tolerant parsing; if it is unrecoverable, it asks the model
 to reformulate (max 1 retry).
+- The final answer is generated only after `READY` (or a hard safety limit), in a
+  separate turn. Its `Image N` citations are checked against the images in context.
 - This is the most fragile point of the system with small models: substantial
 iteration on the prompt is expected. → record everything in NOTES.md.
 

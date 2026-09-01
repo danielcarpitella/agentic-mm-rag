@@ -13,7 +13,8 @@ from pathlib import Path
 from .config import OrchestratorConfig
 from .lmm import LMM, Message
 from .prompts import (
-    ANSWER_INSTRUCTION,
+    CORRECT_ANSWER_INSTRUCTION,
+    DECISION_INSTRUCTION,
     FINAL_ANSWER_INSTRUCTION,
     RESULTS_HEADER,
     RETRY_INSTRUCTION,
@@ -36,6 +37,7 @@ SEARCH_PATTERNS = [
     re.compile(r"SEARCH\s*\(\s*([^)]+?)\s*\)"),
     re.compile(r"SEARCH\s*[:\-]\s*(.+)"),
 ]
+IMAGE_LABEL_PATTERN = re.compile(r"\bImage\s+(\d+)\b", re.IGNORECASE)
 
 
 def extract_search(text: str) -> str | None:
@@ -45,6 +47,17 @@ def extract_search(text: str) -> str | None:
         if match:
             return match.group(1).strip()
     return None
+
+
+def is_ready(text: str) -> bool:
+    """READY is valid only when it is the complete decision."""
+    return text.strip().upper() == "READY"
+
+
+def has_valid_image_citations(text: str, images_used: int) -> bool:
+    """Require at least one citation and reject labels not in the context."""
+    labels = [int(label) for label in IMAGE_LABEL_PATTERN.findall(text)]
+    return bool(labels) and all(1 <= label <= images_used for label in labels)
 
 
 class Orchestrator:
@@ -80,15 +93,56 @@ class Orchestrator:
         lines = [RESULTS_HEADER]
         for offset, hit in enumerate(hits):
             lines.append(f"Image {first_label + offset}: {hit.caption}")
-        lines.append(ANSWER_INSTRUCTION.format(question=question))
+        lines.append(DECISION_INSTRUCTION.format(question=question))
         return Message(
             role="user",
             text="\n".join(lines),
             images=[str(hit.image_path) for hit in hits],
         )
 
+    @staticmethod
+    def _available_labels(images_used: int) -> str:
+        return ", ".join(f"Image {label}" for label in range(1, images_used + 1))
+
+    def _generate_final(
+        self,
+        messages: list[Message],
+        question: str,
+        images_used: int,
+    ) -> str:
+        available_labels = self._available_labels(images_used)
+        instruction = FINAL_ANSWER_INSTRUCTION.format(
+            question=question,
+            available_labels=available_labels or "none",
+        )
+        messages.append(Message(role="user", text=instruction))
+        self._log("FINAL ANSWER - PROMPT SENT", instruction)
+
+        output = self.lmm.generate(messages)
+        self._log("FINAL ANSWER - RAW OUTPUT", output)
+        if has_valid_image_citations(output, images_used):
+            self._log("FINAL ANSWER", output)
+            return output
+
+        self._log(
+            "FINAL ANSWER - INVALID CITATIONS",
+            f"available labels: {available_labels or 'none'}",
+        )
+        messages.append(Message(role="assistant", text=output))
+        correction = CORRECT_ANSWER_INSTRUCTION.format(
+            available_labels=available_labels or "none"
+        )
+        messages.append(Message(role="user", text=correction))
+        corrected = self.lmm.generate(messages)
+        self._log("FINAL ANSWER - CORRECTED OUTPUT", corrected)
+
+        if not has_valid_image_citations(corrected, images_used):
+            self._log("FINAL ANSWER - VALIDATION STILL FAILED", corrected)
+        return corrected
+
     def run(self, question: str) -> str:
-        # Run the loop: generate, interpret SEARCH, retrieve images, and answer.
+        # Alternate one model decision with at most one retrieval. Answering is
+        # a separate generation step reached only through READY or a hard limit.
         messages = [
             Message(role="system", text=SYSTEM_PROMPT),
             Message(role="user", text=question),
@@ -104,21 +158,34 @@ class Orchestrator:
             self._log(f"STEP {step} - RAW OUTPUT", output)
 
             query = extract_search(output)
+            if query is None and is_ready(output):
+                self._log(f"STEP {step} - READY", "model declared evidence sufficient")
+                messages.append(Message(role="assistant", text="READY"))
+                if images_used:
+                    return self._generate_final(messages, question, images_used)
+
             if query is None:
-                # No trigger: either this is the final answer, or the model tried
-                # to search with the wrong format (one recovery attempt only).
-                if "SEARCH" in output.upper() and not retried:
-                    retried = True  # tracks whether a correction attempt has already been made
-                    self._log(f"STEP {step} - MALFORMED TRIGGER", "requesting rephrasing")
+                if not retried:
+                    retried = True
+                    self._log(
+                        f"STEP {step} - INVALID DECISION",
+                        "requesting exactly one SEARCH or READY",
+                    )
                     messages.append(Message(role="assistant", text=output))
                     messages.append(Message(role="user", text=RETRY_INSTRUCTION))
-                    continue # restart the loop and call the model again
-                self._log(f"STEP {step} - FINAL ANSWER", output)
+                    continue
+
+                self._log(f"STEP {step} - DECISION RETRY FAILED", output)
+                if images_used:
+                    return self._generate_final(messages, question, images_used)
                 return output
 
             self._log(f"STEP {step} - EXTRACTED TRIGGER", query)
 
             budget = self.cfg.max_images_in_context - images_used
+            if budget <= 0:
+                self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
+                return self._generate_final(messages, question, images_used)
 
             hits = self.retriever.search(query, k=min(self.top_k, budget))
             self._log(
@@ -126,8 +193,10 @@ class Orchestrator:
                 "\n".join(f"[{h.score:.3f}] {h.id} -> {h.image_path}" for h in hits),
             )
 
-            # Save the model's previous response, namely the SEARCH(...) trigger.
-            messages.append(Message(role="assistant", text=output))
+            # Preserve only the parsed action actually executed. A small model can
+            # emit extra SEARCH(...) lines, which must not look completed in the
+            # next turn's conversation history.
+            messages.append(Message(role="assistant", text=f'SEARCH("{query}")'))
 
             # Add a new user message containing retrieved images, captions,
             # labels, and instructions for answering the question.
@@ -135,13 +204,8 @@ class Orchestrator:
             images_used += len(hits)
 
             if images_used >= self.cfg.max_images_in_context:
-                # In this case, on the next loop iteration the model will directly
-                # return the output with the final answer.
+                self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
+                return self._generate_final(messages, question, images_used)
 
-                messages.append(Message(role="user", text=FINAL_ANSWER_INSTRUCTION))
-
-        # Iteration limit reached: force a final answer.
-        messages.append(Message(role="user", text=FINAL_ANSWER_INSTRUCTION))
-        final = self.lmm.generate(messages)
-        self._log("FINAL ANSWER (forced by step limit)", final)
-        return final
+        self._log("STEP LIMIT", "forcing final answer")
+        return self._generate_final(messages, question, images_used)

@@ -2,13 +2,13 @@ model:
   name: "mlx-community/Qwen2-VL-2B-Instruct-4bit"
   backend: "mlx"            # alternative future: "transformers-mps"
   max_new_tokens: 512
-  temperature: 0.2
+  temperature: 0.0
 
 retriever:
   encoder: "openai/clip-vit-base-patch32"
   index_backend: "faiss"    # alternative: "chroma"
   index_dir: "index/"
-  top_k: 3
+  top_k: 1
   mode: "text2image"        # alternative: "text2text", "hybrid"
 
 orchestrator:
