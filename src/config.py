@@ -33,6 +33,7 @@ class RetrieverConfig:
 class OrchestratorConfig:
     max_steps: int
     max_images_in_context: int
+    decision_max_new_tokens: int = 48
 
 
 @dataclass

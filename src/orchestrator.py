@@ -15,6 +15,7 @@ from .lmm import LMM, Message
 from .prompts import (
     CORRECT_ANSWER_INSTRUCTION,
     DECISION_INSTRUCTION,
+    DUPLICATE_RESULT_INSTRUCTION,
     FINAL_ANSWER_INSTRUCTION,
     RESULTS_HEADER,
     RETRY_INSTRUCTION,
@@ -50,8 +51,9 @@ def extract_search(text: str) -> str | None:
 
 
 def is_ready(text: str) -> bool:
-    """READY is valid only when it is the complete decision."""
-    return text.strip().upper() == "READY"
+    """Accept READY (optionally punctuated) when it is the first decision."""
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return re.fullmatch(r"READY[.!]?", first_line, re.IGNORECASE) is not None
 
 
 def has_valid_image_citations(text: str, images_used: int) -> bool:
@@ -104,6 +106,18 @@ class Orchestrator:
     def _available_labels(images_used: int) -> str:
         return ", ".join(f"Image {label}" for label in range(1, images_used + 1))
 
+    @staticmethod
+    def _citation_example(images_used: int) -> str:
+        """Return an example that never mentions a label outside the context."""
+        if images_used == 0:
+            return '"A visual claim must be followed by its available image label."'
+        if images_used == 1:
+            return '"The structure has a curved roof (Image 1)."'
+        return (
+            '"The first structure has rounded arches (Image 1), while the second '
+            'has curved roof shells (Image 2)."'
+        )
+
     def _generate_final(
         self,
         messages: list[Message],
@@ -114,6 +128,7 @@ class Orchestrator:
         instruction = FINAL_ANSWER_INSTRUCTION.format(
             question=question,
             available_labels=available_labels or "none",
+            citation_example=self._citation_example(images_used),
         )
         messages.append(Message(role="user", text=instruction))
         self._log("FINAL ANSWER - PROMPT SENT", instruction)
@@ -130,11 +145,18 @@ class Orchestrator:
         )
         messages.append(Message(role="assistant", text=output))
         correction = CORRECT_ANSWER_INSTRUCTION.format(
-            available_labels=available_labels or "none"
+            available_labels=available_labels or "none",
+            citation_example=self._citation_example(images_used),
         )
         messages.append(Message(role="user", text=correction))
         corrected = self.lmm.generate(messages)
         self._log("FINAL ANSWER - CORRECTED OUTPUT", corrected)
+
+        if corrected.strip() == output.strip():
+            self._log(
+                "FINAL ANSWER - CORRECTION UNCHANGED",
+                "the bounded retry reproduced the original answer",
+            )
 
         if not has_valid_image_citations(corrected, images_used):
             self._log("FINAL ANSWER - VALIDATION STILL FAILED", corrected)
@@ -148,13 +170,17 @@ class Orchestrator:
             Message(role="user", text=question),
         ]
         images_used = 0
+        seen_image_labels: dict[str, int] = {}
         retried = False
 
         self._log("QUESTION", question)
 
         for step in range(self.cfg.max_steps):
             self._log(f"STEP {step} - PROMPT SENT", "\n".join(m.text for m in messages))
-            output = self.lmm.generate(messages)
+            output = self.lmm.generate(
+                messages,
+                max_new_tokens=self.cfg.decision_max_new_tokens,
+            )
             self._log(f"STEP {step} - RAW OUTPUT", output)
 
             query = extract_search(output)
@@ -198,10 +224,36 @@ class Orchestrator:
             # next turn's conversation history.
             messages.append(Message(role="assistant", text=f'SEARCH("{query}")'))
 
+            duplicate_labels = []
+            new_hits = []
+            for hit in hits:
+                if hit.id in seen_image_labels:
+                    duplicate_labels.append(seen_image_labels[hit.id])
+                    continue
+                seen_image_labels[hit.id] = images_used + len(new_hits) + 1
+                new_hits.append(hit)
+
+            if duplicate_labels:
+                existing_labels = ", ".join(
+                    f"Image {label}" for label in sorted(set(duplicate_labels))
+                )
+                self._log(
+                    f"STEP {step} - DUPLICATE HITS",
+                    f"{existing_labels} already in context; no new label assigned",
+                )
+
+            if duplicate_labels and not new_hits:
+                feedback = DUPLICATE_RESULT_INSTRUCTION.format(
+                    existing_labels=existing_labels
+                )
+                messages.append(Message(role="user", text=feedback))
+                continue
+
             # Add a new user message containing retrieved images, captions,
             # labels, and instructions for answering the question.
-            messages.append(self._results_message(hits, images_used + 1, question))
-            images_used += len(hits)
+            first_label = images_used + 1
+            messages.append(self._results_message(new_hits, first_label, question))
+            images_used += len(new_hits)
 
             if images_used >= self.cfg.max_images_in_context:
                 self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")

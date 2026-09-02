@@ -42,7 +42,11 @@ class LMM:
                 "(available: 'mlx', 'transformers-cuda')."
             )
 
-    def generate(self, messages: list[Message]) -> str:
+    def generate(
+        self,
+        messages: list[Message],
+        max_new_tokens: int | None = None,
+    ) -> str:
         """messages may contain text and images (local paths).
 
         Roles are passed to the model's chat template (the standard format the
@@ -55,10 +59,13 @@ class LMM:
         the retrieval results.
         """
         if self.cfg.backend == "transformers-cuda":
-            return self._generate_transformers_cuda(messages)
+            return self._generate_transformers_cuda(messages, max_new_tokens)
 
         chat = [{"role": m.role, "content": m.text} for m in messages]
         image_paths = [img for m in messages for img in m.images]
+        token_limit = (
+            self.cfg.max_new_tokens if max_new_tokens is None else max_new_tokens
+        )
 
         # apply_chat_template converts structured conversation messages into a
         # string in the exact format expected by the Qwen2-VL model.
@@ -73,7 +80,7 @@ class LMM:
             self.processor,
             formatted_prompt,
             image=image_paths or None,
-            max_tokens=self.cfg.max_new_tokens,
+            max_tokens=token_limit,
             temperature=self.cfg.temperature,
             verbose=False,
         )
@@ -103,7 +110,11 @@ class LMM:
         self.model.eval()
         self.processor = AutoProcessor.from_pretrained(self.cfg.name)
 
-    def _generate_transformers_cuda(self, messages: list[Message]) -> str:
+    def _generate_transformers_cuda(
+        self,
+        messages: list[Message],
+        max_new_tokens: int | None = None,
+    ) -> str:
         """Generate using the Qwen2-VL Transformers format."""
         from PIL import Image
 
@@ -134,7 +145,11 @@ class LMM:
         ).to("cuda")
 
         generation_args = {
-            "max_new_tokens": self.cfg.max_new_tokens,
+            "max_new_tokens": (
+                self.cfg.max_new_tokens
+                if max_new_tokens is None
+                else max_new_tokens
+            ),
             "do_sample": self.cfg.temperature > 0,
         }
         if self.cfg.temperature > 0:

@@ -84,6 +84,7 @@ CLIP space and the LMM space (building one would require a trained module — ou
 
 ```python
 context = system_prompt + question
+retrieved_ids = set()
 for step in range(MAX_STEPS):
     decision = lmm.generate(context)        # exactly one SEARCH(...) or READY
     if decision == READY:
@@ -91,6 +92,10 @@ for step in range(MAX_STEPS):
         return validate_image_citations(answer)
     query = extract_first_search(decision)
     result = retriever.search(query, k=1)
+    if result.id in retrieved_ids:
+        context = add_duplicate_feedback(context, result.id)
+        continue
+    retrieved_ids.add(result.id)
     context = add_executed_search_and_image(context, query, result)
 return forced_grounded_answer()
 ```
@@ -100,6 +105,9 @@ and small models require full control over the literal prompt.
 - Architectural invariant: the orchestrator executes at most one retrieval per
 model turn, then returns the result to the model for a new decision. Extra
 `SEARCH(...)` text in the same output is not queued or executed automatically.
+- Retrieved IDs already present in the context are not assigned another `Image N`
+  label and do not consume the image budget. The model receives explicit duplicate
+  feedback and makes a new decision; the attempted action still consumes one step.
 
 
 
