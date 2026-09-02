@@ -17,6 +17,8 @@ from .prompts import (
     DECISION_INSTRUCTION,
     DUPLICATE_RESULT_INSTRUCTION,
     FINAL_ANSWER_INSTRUCTION,
+    FINAL_ANSWER_SYSTEM_PROMPT,
+    NO_EVIDENCE_FINAL_ANSWER_INSTRUCTION,
     RESULTS_HEADER,
     RETRY_INSTRUCTION,
     SYSTEM_PROMPT,
@@ -39,6 +41,17 @@ SEARCH_PATTERNS = [
     re.compile(r"SEARCH\s*[:\-]\s*(.+)"),
 ]
 IMAGE_LABEL_PATTERN = re.compile(r"\bImage\s+(\d+)\b", re.IGNORECASE)
+PARENTHETICAL_IMAGE_LABEL_PATTERN = re.compile(
+    r"\(\s*Image\s+(\d+)\s*\)", re.IGNORECASE
+)
+IMAGE_PLACEHOLDER_PATTERN = re.compile(r"\bImage\s+N\b", re.IGNORECASE)
+INSTRUCTION_ECHO_FRAGMENTS = (
+    "required citation tokens",
+    "mandatory citation tokens",
+    "image identities",
+    "write one concise visual observation",
+    "sentence 1:",
+)
 
 
 def extract_search(text: str) -> str | None:
@@ -57,9 +70,34 @@ def is_ready(text: str) -> bool:
 
 
 def has_valid_image_citations(text: str, images_used: int) -> bool:
-    """Require at least one citation and reject labels not in the context."""
-    labels = [int(label) for label in IMAGE_LABEL_PATTERN.findall(text)]
-    return bool(labels) and all(1 <= label <= images_used for label in labels)
+    """Validate complete parenthetical citations and reject degenerate output."""
+    if images_used <= 0 or IMAGE_PLACEHOLDER_PATTERN.search(text):
+        return False
+
+    expected_labels = set(range(1, images_used + 1))
+    citation_matches = list(PARENTHETICAL_IMAGE_LABEL_PATTERN.finditer(text))
+    citation_labels = {int(match.group(1)) for match in citation_matches}
+    if citation_labels != expected_labels:
+        return False
+
+    # Every occurrence of "Image N" must be part of a parenthetical citation.
+    citation_spans = [match.span() for match in citation_matches]
+    for mention in IMAGE_LABEL_PATTERN.finditer(text):
+        start, end = mention.span()
+        if not any(
+            span_start <= start and end <= span_end
+            for span_start, span_end in citation_spans
+        ):
+            return False
+
+    # A citation by itself is not a visual observation.
+    content_without_citations = PARENTHETICAL_IMAGE_LABEL_PATTERN.sub("", text)
+    words = re.findall(r"\b[A-Za-z][A-Za-z'-]*\b", content_without_citations)
+    if len(words) < 5:
+        return False
+
+    lowered = text.lower()
+    return not any(fragment in lowered for fragment in INSTRUCTION_ECHO_FRAGMENTS)
 
 
 class Orchestrator:
@@ -107,49 +145,118 @@ class Orchestrator:
         return ", ".join(f"Image {label}" for label in range(1, images_used + 1))
 
     @staticmethod
-    def _citation_example(images_used: int) -> str:
-        """Return an example that never mentions a label outside the context."""
-        if images_used == 0:
-            return '"A visual claim must be followed by its available image label."'
-        if images_used == 1:
-            return '"The structure has a curved roof (Image 1)."'
-        return (
-            '"The first structure has rounded arches (Image 1), while the second '
-            'has curved roof shells (Image 2)."'
+    def _response_structure(evidence: list[tuple[int, Hit]]) -> str:
+        """Build label-specific guidance without supplying copyable visual claims."""
+        lines = []
+        for sentence_number, (label, hit) in enumerate(evidence, start=1):
+            landmark = hit.id.replace("_", " ")
+            lines.append(
+                f"Sentence {sentence_number}: begin exactly with "
+                f'"(Image {label}):" and then describe one visible detail of {landmark}.'
+            )
+        if len(evidence) > 1:
+            citations = " and ".join(f"(Image {label})" for label, _ in evidence)
+            lines.append(
+                f'Final sentence: begin exactly with "{citations}:" and compare only '
+                "the visible details already described."
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _image_mapping(evidence: list[tuple[int, Hit]]) -> str:
+        return "\n".join(
+            f"Image {label} — {hit.id.replace('_', ' ')}" for label, hit in evidence
         )
+
+    @staticmethod
+    def _required_citations(evidence: list[tuple[int, Hit]]) -> str:
+        return ", ".join(f"(Image {label})" for label, _ in evidence)
+
+    @staticmethod
+    def _messages_for_log(messages: list[Message]) -> str:
+        blocks = []
+        for message in messages:
+            block = [f"[{message.role.upper()}]", message.text]
+            if message.images:
+                block.append("Attached images: " + ", ".join(message.images))
+            blocks.append("\n".join(block))
+        return "\n\n".join(blocks)
+
+    def _final_messages(
+        self,
+        question: str,
+        evidence: list[tuple[int, Hit]],
+        *,
+        correction: bool = False,
+    ) -> list[Message]:
+        template = (
+            CORRECT_ANSWER_INSTRUCTION if correction else FINAL_ANSWER_INSTRUCTION
+        )
+        instruction = template.format(
+            question=question,
+            image_mapping=self._image_mapping(evidence),
+            required_citations=self._required_citations(evidence),
+            response_structure=self._response_structure(evidence),
+        )
+        return [
+            Message(role="system", text=FINAL_ANSWER_SYSTEM_PROMPT),
+            Message(
+                role="user",
+                text=instruction,
+                images=[str(hit.image_path) for _, hit in evidence],
+            ),
+        ]
 
     def _generate_final(
         self,
-        messages: list[Message],
+        decision_messages: list[Message],
         question: str,
-        images_used: int,
+        evidence: list[tuple[int, Hit]],
     ) -> str:
-        available_labels = self._available_labels(images_used)
-        instruction = FINAL_ANSWER_INSTRUCTION.format(
-            question=question,
-            available_labels=available_labels or "none",
-            citation_example=self._citation_example(images_used),
-        )
-        messages.append(Message(role="user", text=instruction))
-        self._log("FINAL ANSWER - PROMPT SENT", instruction)
+        if not evidence:
+            fallback_messages = [
+                *decision_messages,
+                Message(
+                    role="user",
+                    text=NO_EVIDENCE_FINAL_ANSWER_INSTRUCTION.format(question=question),
+                ),
+            ]
+            self._log(
+                "FINAL ANSWER - NO EVIDENCE PROMPT",
+                self._messages_for_log(fallback_messages),
+            )
+            output = self.lmm.generate(fallback_messages)
+            self._log("FINAL ANSWER - RAW OUTPUT", output)
+            return output
 
-        output = self.lmm.generate(messages)
+        images_used = len(evidence)
+        available_labels = self._available_labels(images_used)
+        final_messages = self._final_messages(question, evidence)
+        self._log(
+            "FINAL ANSWER - PROMPT SENT",
+            self._messages_for_log(final_messages),
+        )
+
+        output = self.lmm.generate(final_messages)
         self._log("FINAL ANSWER - RAW OUTPUT", output)
         if has_valid_image_citations(output, images_used):
             self._log("FINAL ANSWER", output)
             return output
 
         self._log(
-            "FINAL ANSWER - INVALID CITATIONS",
-            f"available labels: {available_labels or 'none'}",
+            "FINAL ANSWER - INVALID",
+            f"required labels: {available_labels}",
         )
-        messages.append(Message(role="assistant", text=output))
-        correction = CORRECT_ANSWER_INSTRUCTION.format(
-            available_labels=available_labels or "none",
-            citation_example=self._citation_example(images_used),
+        correction_messages = self._final_messages(
+            question,
+            evidence,
+            correction=True,
         )
-        messages.append(Message(role="user", text=correction))
-        corrected = self.lmm.generate(messages)
+        self._log(
+            "FINAL ANSWER - REGENERATION PROMPT SENT",
+            self._messages_for_log(correction_messages),
+        )
+        corrected = self.lmm.generate(correction_messages)
         self._log("FINAL ANSWER - CORRECTED OUTPUT", corrected)
 
         if corrected.strip() == output.strip():
@@ -160,6 +267,13 @@ class Orchestrator:
 
         if not has_valid_image_citations(corrected, images_used):
             self._log("FINAL ANSWER - VALIDATION STILL FAILED", corrected)
+            self._log(
+                "FINAL ANSWER - KEEPING ORIGINAL",
+                "the unvalidated regeneration did not replace the first answer",
+            )
+            return output
+
+        self._log("FINAL ANSWER", corrected)
         return corrected
 
     def run(self, question: str) -> str:
@@ -170,6 +284,7 @@ class Orchestrator:
             Message(role="user", text=question),
         ]
         images_used = 0
+        retrieved_evidence: list[tuple[int, Hit]] = []
         seen_image_labels: dict[str, int] = {}
         retried = False
 
@@ -188,7 +303,7 @@ class Orchestrator:
                 self._log(f"STEP {step} - READY", "model declared evidence sufficient")
                 messages.append(Message(role="assistant", text="READY"))
                 if images_used:
-                    return self._generate_final(messages, question, images_used)
+                    return self._generate_final(messages, question, retrieved_evidence)
 
             if query is None:
                 if not retried:
@@ -203,7 +318,7 @@ class Orchestrator:
 
                 self._log(f"STEP {step} - DECISION RETRY FAILED", output)
                 if images_used:
-                    return self._generate_final(messages, question, images_used)
+                    return self._generate_final(messages, question, retrieved_evidence)
                 return output
 
             self._log(f"STEP {step} - EXTRACTED TRIGGER", query)
@@ -211,7 +326,7 @@ class Orchestrator:
             budget = self.cfg.max_images_in_context - images_used
             if budget <= 0:
                 self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
-                return self._generate_final(messages, question, images_used)
+                return self._generate_final(messages, question, retrieved_evidence)
 
             hits = self.retriever.search(query, k=min(self.top_k, budget))
             self._log(
@@ -230,8 +345,10 @@ class Orchestrator:
                 if hit.id in seen_image_labels:
                     duplicate_labels.append(seen_image_labels[hit.id])
                     continue
-                seen_image_labels[hit.id] = images_used + len(new_hits) + 1
+                label = images_used + len(new_hits) + 1
+                seen_image_labels[hit.id] = label
                 new_hits.append(hit)
+                retrieved_evidence.append((label, hit))
 
             if duplicate_labels:
                 existing_labels = ", ".join(
@@ -257,7 +374,7 @@ class Orchestrator:
 
             if images_used >= self.cfg.max_images_in_context:
                 self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
-                return self._generate_final(messages, question, images_used)
+                return self._generate_final(messages, question, retrieved_evidence)
 
         self._log("STEP LIMIT", "forcing final answer")
-        return self._generate_final(messages, question, images_used)
+        return self._generate_final(messages, question, retrieved_evidence)

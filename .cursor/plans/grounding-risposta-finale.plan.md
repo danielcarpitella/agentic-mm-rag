@@ -1,25 +1,25 @@
 ---
 name: grounding risposta finale
-overview: "Continuazione del piano “Stabilizzare il loop agentico”: la state machine di retrieval resta congelata, mentre questa fase ridisegna la generazione finale per ottenere citazioni complete e risposte basate sulle immagini anziché sulle caption."
+overview: "Continuazione del piano “Stabilizzare il loop agentico”: la fase finale pulita è stata implementata e verificata. Il grounding visivo migliora, ma Qwen2-VL-2B continua a ignorare le citazioni; il limite è documentato senza post-processing ingannevole."
 todos:
   - id: checkpoint-baseline
     content: Registrare il run 17:57 in NOTES.md e committare lo stato corrente come checkpoint
     status: completed
   - id: isolate-final-context
     content: Costruire la risposta finale da immagini e label in un contesto multimodale pulito
-    status: pending
+    status: completed
   - id: strengthen-final-contract
     content: Rimuovere esempi copiabili e imporre osservazioni visive con citazioni complete
-    status: pending
+    status: completed
   - id: replace-correction-pass
     content: Usare una sola rigenerazione pulita senza risposta precedente o caption
-    status: pending
+    status: completed
   - id: test-final-grounding
     content: Aggiornare ed estendere i test e rieseguire la valutazione MLX sui quattro casi
-    status: pending
+    status: completed
   - id: document-observed-result
     content: Aggiornare note e stato del piano solo con il risultato verificato
-    status: pending
+    status: completed
 isProject: true
 ---
 
@@ -62,21 +62,31 @@ istruzioni sopra.
 
 ### 1. Contesto finale pulito
 
-- In [`src/orchestrator.py`](../../src/orchestrator.py), conservare gli hit unici
-  insieme alla label assegnata (lista ordinata `(label, hit)`), non soltanto
-  `images_used`.
-- Al momento della risposta, costruire una nuova conversazione multimodale
-  contenente esclusivamente: un system prompt minimo dedicato alla risposta
-  (rispondere solo da ciò che è visibile, citare le label), la domanda, le
-  immagini e le associazioni minimali di identificazione. I ruoli reali sono
-  necessari: è documentato che il 2B ignora le istruzioni concatenate senza ruolo.
-- Allegare tutte le immagini a un solo messaggio user, nell'ordine delle label
-  (entrambi i backend in [`src/lmm.py`](../../src/lmm.py) preservano l'ordine dei
-  messaggi).
-- Per l'identificazione usare un nome leggibile derivato da `hit.id`
-  (underscore → spazi, es. `Image 1 — sydney opera house`): serve solo a dire
-  quale landmark è quale, non come fonte di fatti, ed evita che il modello ricopi
-  l'id grezzo nella risposta della demo.
+- Durante il retrieval, in [`src/orchestrator.py`](../../src/orchestrator.py),
+  conservare una lista ordinata delle immagini uniche recuperate. Ogni elemento
+  contiene sia la label assegnata sia l'intero `Hit`, per esempio
+  `[(1, hit_colosseum), (2, hit_sydney)]`. Il solo contatore `images_used` dice
+  quante immagini esistono, ma non permette di ricostruire quale file e quale
+  landmark corrispondono a ciascuna label.
+- Quando il loop arriva alla risposta finale, **non riutilizzare** la lista
+  `messages` usata per `SEARCH/READY`. Creare invece una nuova conversazione
+  `answer_messages`, indipendente dalla precedente.
+- La nuova conversazione contiene soltanto due messaggi:
+  1. un messaggio `system` breve, dedicato alla risposta, che ordina di descrivere
+     esclusivamente elementi visibili e di citare le immagini;
+  2. un messaggio `user` con la domanda originale, l'elenco delle associazioni
+     tra label e landmark e tutte le immagini.
+- Allegare le immagini al messaggio `user` nello stesso ordine delle label. Per
+  esempio, nel confronto Colosseo–Sydney, il testo indica
+  `Image 1 — colosseum` e `Image 2 — sydney opera house`, mentre l'elenco dei
+  file contiene prima la foto del Colosseo e poi quella di Sydney. In questo modo
+  il modello può associare senza ambiguità ogni citazione alla relativa immagine.
+- Nell'elenco usare un nome leggibile derivato da `hit.id` (underscore → spazi):
+  serve soltanto a identificare il landmark, non fornisce la risposta e non
+  espone nella demo un id tecnico come `sydney_opera_house`.
+- Mantenere separati i ruoli `system` e `user`: è già documentato che il 2B tende
+  a ignorare le istruzioni quando vengono concatenate alla domanda come testo
+  indistinto.
 - Escludere dalla generazione finale cronologia `SEARCH/READY`, system prompt
   decisionale e caption descrittive. Le caption restano disponibili nel retrieval
   loop, ma non diventano una scorciatoia testuale per la risposta.
@@ -88,8 +98,26 @@ istruzioni sopra.
 
 ### 2. Prompt strutturale senza contenuto copiabile
 
-- In [`src/prompts.py`](../../src/prompts.py), sostituire il few-shot concreto
-  con un contratto di formato privo di esempi semantici.
+- In [`src/prompts.py`](../../src/prompts.py), eliminare frasi di esempio che
+  descrivono un contenuto specifico, come «The structure has a curved roof
+  (Image 1)». Il modello 2B può copiarle come risposta anche quando l'immagine
+  mostra tutt'altro, come è successo con Stonehenge.
+- Non lasciare però il 2B senza guida: sostituire il few-shot semantico con uno
+  **scaffold dinamico e molto esplicito**, costruito sulle label realmente
+  disponibili. Lo scaffold mostra i token esatti obbligatori, per esempio
+  `Required citation tokens: (Image 1), (Image 2)`, e assegna una funzione a
+  ciascuna frase senza fornire una possibile risposta visiva.
+- Con una sola immagine, ordinare di scrivere una breve osservazione visibile e
+  iniziare la frase esattamente con `(Image 1):`. Con due immagini, ordinare una
+  frase che inizi con `(Image 1):`, una con `(Image 2):` e una frase di confronto
+  introdotta da entrambe le citazioni. Il prefisso è preferito al suffisso perché
+  i run precedenti documentati in NOTES mostrano che il 2B segue meglio un inizio
+  di frase concreto. In questo modo riceve label e struttura precise, ma non può
+  copiare contenuti come “curved roof” in una risposta su Stonehenge.
+- Questa soluzione è un'ipotesi da verificare nel run MLX, non una garanzia: i
+  run precedenti mostrano che il 2B fatica senza guida, ma che gli esempi
+  semantici possono essere copiati. Il confronto con il baseline stabilirà se lo
+  scaffold risolve entrambe le debolezze.
 - Il contratto elenca sempre le label concrete disponibili (`Image 1`,
   `Image 2`, …), mai il placeholder generico `Image N`: è documentato in NOTES.md
   che il modello copia i placeholder alla lettera.
@@ -160,17 +188,32 @@ istruzioni sopra.
 - Se il 2B fallisce ancora con il contesto pulito, il limite viene documentato
   invece di mascherarlo con post-processing semantico non affidabile.
 
+## Risultato verificato alle 19:58
+
+- I sette test deterministici passano e il controllo lint non segnala errori.
+  Contesto finale, immagini e label sono isolati e ordinati; la rigenerazione è
+  singola e non contiene risposta precedente, caption o cronologia decisionale.
+- Due run MLX completi hanno mantenuto retrieval, dedup e terminazione del
+  checkpoint. Il contesto pulito ha eliminato la copia dell'esempio del tetto e
+  ha migliorato soprattutto le descrizioni iniziali di Sydney e Stonehenge.
+- Il criterio sulle citazioni non è stato raggiunto: sia lo scaffold con label a
+  fine frase sia quello più vincolante con label come prefisso hanno prodotto
+  0/4 risposte valide nella forma parentetica richiesta. Il modello omette le
+  label nei casi singoli e usa talvolta `Image 1:` senza parentesi nei multi.
+- La rigenerazione non corregge le citazioni e tende ad allungare o peggiorare la
+  risposta. Se resta invalida viene ora loggata e scartata, mantenendo l'output
+  originale invece di sostituirlo con altro contenuto non validato.
+- Il grounding multi-image resta debole: compaiono dettagli non visibili e
+  contaminazioni tra monumenti anche senza caption. Come previsto dai criteri,
+  il limite del 2B è registrato in NOTES.md e non viene nascosto aggiungendo
+  citazioni deterministicamente.
+
 ## Checkpoint e documentazione
 
-Prima dell'implementazione, due azioni concrete: aggiungere a
-[`docs/NOTES.md`](../../docs/NOTES.md) la voce con i risultati osservati del run
-17:57 e committare lo stato corrente del repository — le modifiche del piano
-precedente (`config.yaml`, `src/`, `tests/`, `docs/`) sono ancora non committate,
-e quel commit è il checkpoint a cui poter tornare.
+Il checkpoint precedente è stato salvato nel commit `a72e734` e il run 17:57 è
+registrato in [`docs/NOTES.md`](../../docs/NOTES.md).
 
-Dopo il nuovo run, aggiornare NOTES.md soltanto con risultati osservati,
-mantenendo il promemoria per la demo: privilegiare domande la cui risposta non è
-già nella caption, con Sydney roof come caso positivo.
-
-Stima realistica: 2–3 ore per implementazione e test, più 1–2 ore per run MLX e
-un'eventuale iterazione mirata.
+Il risultato dei run 19:56 e 19:58 è stato aggiunto alle note mantenendo il
+promemoria per la demo: privilegiare domande la cui risposta non è già nella
+caption, con Sydney roof come caso visivamente positivo ma non ancora conforme
+nelle citazioni.

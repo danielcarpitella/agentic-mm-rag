@@ -6,7 +6,7 @@ import unittest
 
 from src.config import OrchestratorConfig
 from src.lmm import Message
-from src.orchestrator import Orchestrator, is_ready
+from src.orchestrator import Orchestrator, has_valid_image_citations, is_ready
 from src.retriever import Hit
 
 
@@ -38,12 +38,22 @@ class FakeRetriever:
         return [self.hit][:k]
 
 
+class MappingRetriever:
+    def __init__(self, hits_by_query: dict[str, Hit]):
+        self.hits_by_query = hits_by_query
+        self.queries: list[str] = []
+
+    def search(self, query: str, k: int) -> list[Hit]:
+        self.queries.append(query)
+        return [self.hits_by_query[query]][:k]
+
+
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.hit = Hit(
             id="sydney_opera_house",
             image_path=Path("data/images/sydney_opera_house.jpg"),
-            caption="Sydney Opera House",
+            caption="UNIQUE CAPTION TEXT THAT MUST NOT REACH THE FINAL CONTEXT",
             score=0.9,
         )
 
@@ -77,13 +87,19 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual([call[0] for call in lmm.calls], [48, 48, 48, None])
 
         final_messages = lmm.calls[-1][1]
+        self.assertEqual([message.role for message in final_messages], ["system", "user"])
         image_messages = [message for message in final_messages if message.images]
         self.assertEqual(len(image_messages), 1)
-        self.assertNotIn("Image 2:", "\n".join(message.text for message in final_messages))
-        self.assertIn(
-            "already available as Image 1",
-            "\n".join(message.text for message in final_messages),
+        self.assertEqual(
+            image_messages[0].images,
+            ["data/images/sydney_opera_house.jpg"],
         )
+        final_text = "\n".join(message.text for message in final_messages)
+        self.assertIn("Image 1 — sydney opera house", final_text)
+        self.assertIn('begin exactly with "(Image 1):"', final_text)
+        self.assertNotIn("UNIQUE CAPTION TEXT", final_text)
+        self.assertNotIn("already available as Image 1", final_text)
+        self.assertNotIn('SEARCH("', final_text)
 
     def test_duplicate_attempts_consume_steps_and_reach_step_limit(self) -> None:
         lmm = FakeLMM(
@@ -136,8 +152,145 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertEqual(answer, unchanged_answer)
         self.assertEqual(len(lmm.calls), 4)
+        initial_final_messages = lmm.calls[-2][1]
+        correction_messages = lmm.calls[-1][1]
+        self.assertEqual(len(initial_final_messages), 2)
+        self.assertEqual(len(correction_messages), 2)
+        correction_text = "\n".join(message.text for message in correction_messages)
+        self.assertNotIn(unchanged_answer, correction_text)
+        self.assertNotIn("UNIQUE CAPTION TEXT", correction_text)
+        self.assertEqual(
+            correction_messages[-1].images,
+            ["data/images/sydney_opera_house.jpg"],
+        )
         self.assertIn("FINAL ANSWER - CORRECTION UNCHANGED", log_text)
         self.assertIn("FINAL ANSWER - VALIDATION STILL FAILED", log_text)
+
+    def test_failed_regeneration_does_not_replace_original_answer(self) -> None:
+        original = "The roof has several visible curved sections."
+        invalid_regeneration = "A different answer still without any citation."
+        lmm = FakeLMM(
+            [
+                'SEARCH("Sydney Opera House")',
+                "READY",
+                original,
+                invalid_regeneration,
+            ]
+        )
+        cfg = OrchestratorConfig(
+            max_steps=3,
+            max_images_in_context=4,
+            decision_max_new_tokens=48,
+        )
+
+        with TemporaryDirectory() as log_dir:
+            orchestrator = Orchestrator(
+                lmm,
+                FakeRetriever(self.hit),
+                cfg,
+                top_k=1,
+                log_dir=log_dir,
+            )
+            with redirect_stdout(StringIO()):
+                answer = orchestrator.run("Describe the roof.")
+            log_text = orchestrator.log_path.read_text()
+
+        self.assertEqual(answer, original)
+        self.assertEqual(len(lmm.calls), 4)
+        self.assertIn("FINAL ANSWER - KEEPING ORIGINAL", log_text)
+
+    def test_final_context_preserves_two_image_label_order(self) -> None:
+        colosseum = Hit(
+            id="colosseum",
+            image_path=Path("data/images/colosseum.jpg"),
+            caption="FIRST SECRET CAPTION",
+            score=0.9,
+        )
+        sydney = Hit(
+            id="sydney_opera_house",
+            image_path=Path("data/images/sydney_opera_house.jpg"),
+            caption="SECOND SECRET CAPTION",
+            score=0.8,
+        )
+        lmm = FakeLMM(
+            [
+                'SEARCH("Colosseum")',
+                'SEARCH("Sydney Opera House")',
+                "READY",
+                (
+                    "The first facade has stacked arches (Image 1). "
+                    "The second has white shell-like roof forms (Image 2)."
+                ),
+            ]
+        )
+        retriever = MappingRetriever(
+            {"Colosseum": colosseum, "Sydney Opera House": sydney}
+        )
+        cfg = OrchestratorConfig(
+            max_steps=4,
+            max_images_in_context=4,
+            decision_max_new_tokens=48,
+        )
+
+        with TemporaryDirectory() as log_dir:
+            with redirect_stdout(StringIO()):
+                answer = Orchestrator(
+                    lmm, retriever, cfg, top_k=1, log_dir=log_dir
+                ).run("Compare the two landmarks.")
+
+        self.assertTrue(has_valid_image_citations(answer, 2))
+        final_messages = lmm.calls[-1][1]
+        self.assertEqual([message.role for message in final_messages], ["system", "user"])
+        self.assertEqual(
+            final_messages[-1].images,
+            [
+                "data/images/colosseum.jpg",
+                "data/images/sydney_opera_house.jpg",
+            ],
+        )
+        final_text = "\n".join(message.text for message in final_messages)
+        self.assertLess(
+            final_text.index("Image 1 — colosseum"),
+            final_text.index("Image 2 — sydney opera house"),
+        )
+        self.assertIn('begin exactly with "(Image 1):"', final_text)
+        self.assertIn('begin exactly with "(Image 2):"', final_text)
+        self.assertNotIn("FIRST SECRET CAPTION", final_text)
+        self.assertNotIn("SECOND SECRET CAPTION", final_text)
+        self.assertNotIn("SEARCH", final_text)
+
+    def test_final_answer_validation_requires_complete_parenthetical_labels(self) -> None:
+        self.assertTrue(
+            has_valid_image_citations(
+                "One facade has arches (Image 1). Another has shells (Image 2).",
+                2,
+            )
+        )
+        self.assertFalse(
+            has_valid_image_citations("Only one facade has arches (Image 1).", 2)
+        )
+        self.assertFalse(
+            has_valid_image_citations(
+                "One facade has arches (Image 1). Another is tall (Image 3).",
+                2,
+            )
+        )
+        self.assertFalse(
+            has_valid_image_citations(
+                "Image 1 shows a facade with several stacked arches.", 1
+            )
+        )
+        self.assertFalse(
+            has_valid_image_citations(
+                "A visible description is followed by Image N.", 1
+            )
+        )
+        self.assertFalse(has_valid_image_citations("(Image 1).", 1))
+        self.assertFalse(
+            has_valid_image_citations(
+                "Required citation tokens are repeated here (Image 1).", 1
+            )
+        )
 
     def test_ready_allows_terminal_punctuation_and_trailing_echo(self) -> None:
         self.assertTrue(is_ready("READY."))

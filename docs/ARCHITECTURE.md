@@ -85,19 +85,25 @@ CLIP space and the LMM space (building one would require a trained module — ou
 ```python
 context = system_prompt + question
 retrieved_ids = set()
+evidence = []
 for step in range(MAX_STEPS):
     decision = lmm.generate(context)        # exactly one SEARCH(...) or READY
     if decision == READY:
-        answer = lmm.generate(final_instruction)
-        return validate_image_citations(answer)
+        final_context = build_clean_context(question, evidence)
+        answer = lmm.generate(final_context)
+        if validate_complete_citations(answer, evidence):
+            return answer
+        regenerated = lmm.generate(build_clean_retry(question, evidence))
+        return regenerated if validate_complete_citations(regenerated, evidence) else answer
     query = extract_first_search(decision)
     result = retriever.search(query, k=1)
     if result.id in retrieved_ids:
         context = add_duplicate_feedback(context, result.id)
         continue
     retrieved_ids.add(result.id)
+    evidence.append((next_image_label(), result))
     context = add_executed_search_and_image(context, query, result)
-return forced_grounded_answer()
+return generate_from_clean_context(question, evidence)
 ```
 
 - No agentic frameworks (LangChain, etc.): the loop IS the project's contribution,
@@ -173,8 +179,12 @@ flowchart TD
     LMM["Frozen LMM"]
     Decision["One decision"]
     Search{"SEARCH(...) or READY?"}
+    CleanFinal["Fresh question + ordered images + labels"]
     Final["Final answer"]
     Validate{"Valid image labels?"}
+    Retry["One clean regeneration"]
+    RetryValidate{"Valid after regeneration?"}
+    Failed["Log failure; keep original"]
     Query["Extracted text query"]
     ClipText["CLIP text encoder"]
     QueryEmbedding["CLIP query embedding"]
@@ -183,10 +193,12 @@ flowchart TD
     NewContext["Context updated with Image 1, Image 2, ..."]
 
     Question --> Context --> LMM --> Decision --> Search
-    Search -->|READY| Final --> Validate
+    Search -->|READY| CleanFinal --> Final --> Validate
     Search -->|SEARCH| Query --> ClipText --> QueryEmbedding --> Faiss --> Hits --> NewContext --> LMM
     Validate -->|yes| Accepted["Accepted answer"]
-    Validate -->|"no, one correction"| Final
+    Validate -->|no| Retry --> RetryValidate
+    RetryValidate -->|yes| Accepted
+    RetryValidate -->|no| Failed
 ```
 
 
@@ -207,9 +219,14 @@ In order:
 7. The orchestrator inserts the actual image, caption, and next `Image N` label
    into the context, then calls the LMM for a new decision. Only the first search
    from a turn is executed, so every retrieval is followed by a fresh inspection.
-8. When the model emits `READY`, the orchestrator starts a separate answer turn.
-   It accepts the answer only if it cites existing image labels; otherwise it
-   requests one correction.
+8. When the model emits `READY`, the orchestrator creates a fresh final-answer
+   conversation. It contains the original question, readable image identities,
+   and image files in label order, but no decision history or full captions.
+9. The answer is accepted only if every available label appears as a
+   parenthetical citation and no unavailable label appears. Otherwise one clean
+   regeneration is attempted without including the invalid answer. If that also
+   fails, the failure is logged and the original answer is retained rather than
+   adding citations mechanically.
 
 
 
@@ -263,7 +280,9 @@ READY
 recognizable, it attempts tolerant parsing; if it is unrecoverable, it asks the model
 to reformulate (max 1 retry).
 - The final answer is generated only after `READY` (or a hard safety limit), in a
-  separate turn. Its `Image N` citations are checked against the images in context.
+  fresh conversation containing images and minimal identities but no captions or
+  SEARCH/READY history. The validator requires the complete set of parenthetical
+  image citations and permits one clean regeneration.
 - This is the most fragile point of the system with small models: substantial
 iteration on the prompt is expected. → record everything in NOTES.md.
 

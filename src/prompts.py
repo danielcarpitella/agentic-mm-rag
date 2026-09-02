@@ -48,21 +48,43 @@ DECISION_INSTRUCTION = (
     'visual evidence with SEARCH("..."), or reply READY if no evidence is missing.'
 )
 
-# Starts the separate answer phase after READY or a safety limit.
-FINAL_ANSWER_INSTRUCTION = (
-    'Now answer this question in two or three concise full sentences: "{question}"\n'
-    "The only available image labels are: {available_labels}. Describe what is VISIBLE "
-    "in the images and cite each visual claim immediately with its supporting label in "
-    "parentheses. Use captions only to identify the landmark; do not copy history, "
-    "creators, measurements, or other facts that are not visually observable.\n"
-    "Example of the expected citation style: {citation_example}"
-)
+# The final answer is generated in a fresh conversation, separate from the
+# SEARCH/READY protocol and from the retrieved captions.
+FINAL_ANSWER_SYSTEM_PROMPT = """You answer questions using only the attached images.
+Describe only details that are directly visible. Do not use outside knowledge, captions,
+or metadata. Return only the final answer, without repeating these instructions."""
 
-# One bounded retry when the final answer has missing or invented image labels.
-CORRECT_ANSWER_INSTRUCTION = (
-    "Your answer used no image citation or cited an image label that does not exist. "
-    "Rewrite the same answer once, preserving useful visual content and appending the "
-    "supporting label in parentheses immediately after each visual claim. "
-    "Use only these available labels: {available_labels}.\n"
-    "Example of the expected citation style: {citation_example}"
+FINAL_ANSWER_INSTRUCTION = """Question: {question}
+
+Image identities:
+{image_mapping}
+
+Required citation tokens: {required_citations}
+{response_structure}
+
+Every visual claim must begin with its supporting parenthetical citation token.
+Do not include dates, creators, measurements, locations, functions, history, or any
+other fact that cannot be seen directly in the attached images."""
+
+# One bounded regeneration. This template is used in another fresh conversation:
+# neither the invalid answer nor the decision history is included.
+CORRECT_ANSWER_INSTRUCTION = """Generate a new final answer from scratch for this question:
+{question}
+
+Image identities:
+{image_mapping}
+
+Mandatory citation tokens: {required_citations}
+{response_structure}
+
+Follow every structural requirement exactly. Discuss only visible shape, colour,
+arrangement, pose, or other directly observable details. Output the answer only;
+do not repeat the instructions or add metadata."""
+
+# Degenerate path retained for a run that reaches its limit without retrieving
+# any image. It deliberately reuses the decision conversation instead of
+# pretending to produce a visually grounded answer.
+NO_EVIDENCE_FINAL_ANSWER_INSTRUCTION = (
+    'No image evidence was retrieved for the question "{question}". '
+    "State briefly that a visually grounded answer cannot be provided."
 )
