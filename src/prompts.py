@@ -88,3 +88,11 @@ NO_EVIDENCE_FINAL_ANSWER_INSTRUCTION = (
     'No image evidence was retrieved for the question "{question}". '
     "State briefly that a visually grounded answer cannot be provided."
 )
+
+# "Model alone" baseline used by the demo UI (and reusable as the no-RAG
+# condition of an evaluation): the same frozen model, no images, no retrieval.
+BASELINE_SYSTEM_PROMPT = """You are an assistant answering questions about famous landmarks.
+No images are available: answer from your own knowledge only.
+Answer in two or three sentences and return only the answer."""
+
+BASELINE_ANSWER_INSTRUCTION = "Question: {question}"

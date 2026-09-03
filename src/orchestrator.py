@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 from .config import OrchestratorConfig
 from .lmm import LMM, Message
@@ -108,12 +109,16 @@ class Orchestrator:
         cfg: OrchestratorConfig,
         top_k: int,
         log_dir: str | Path = "logs",
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ):
         # Connect the LMM and retriever and prepare the session log file.
         self.lmm = lmm
         self.retriever = retriever
         self.cfg = cfg
         self.top_k = top_k
+        # Optional structured-event sink (used by the demo UI for streaming).
+        # It mirrors what _log already records and never changes the loop.
+        self.on_event = on_event
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / f"run_{datetime.now():%Y%m%d_%H%M%S}.log"
@@ -126,6 +131,11 @@ class Orchestrator:
         print(text)
         with self.log_path.open("a") as f:
             f.write(text + "\n")
+
+    def _emit(self, event_type: str, **data: Any) -> None:
+        """Forward a structured event to the optional sink (no-op by default)."""
+        if self.on_event is not None:
+            self.on_event({"type": event_type, **data})
 
     def _results_message(self, hits: list[Hit], first_label: int, question: str) -> Message:
         # Turn the retrieved hits (class Hit) into the next step's multimodal
@@ -227,6 +237,7 @@ class Orchestrator:
             )
             output = self.lmm.generate(fallback_messages)
             self._log("FINAL ANSWER - RAW OUTPUT", output)
+            self._emit("answer", text=output, valid=False, corrected=False, no_evidence=True)
             return output
 
         images_used = len(evidence)
@@ -237,16 +248,19 @@ class Orchestrator:
             self._messages_for_log(final_messages),
         )
 
+        self._emit("final_prompt", labels=[label for label, _ in evidence])
         output = self.lmm.generate(final_messages)
         self._log("FINAL ANSWER - RAW OUTPUT", output)
         if has_valid_image_citations(output, images_used):
             self._log("FINAL ANSWER", output)
+            self._emit("answer", text=output, valid=True, corrected=False, no_evidence=False)
             return output
 
         self._log(
             "FINAL ANSWER - INVALID",
             f"required labels: {available_labels}",
         )
+        self._emit("invalid_answer", text=output, labels=[label for label, _ in evidence])
         correction_messages = self._final_messages(
             question,
             evidence,
@@ -271,9 +285,11 @@ class Orchestrator:
                 "FINAL ANSWER - KEEPING ORIGINAL",
                 "the unvalidated regeneration did not replace the first answer",
             )
+            self._emit("answer", text=output, valid=False, corrected=False, no_evidence=False)
             return output
 
         self._log("FINAL ANSWER", corrected)
+        self._emit("answer", text=corrected, valid=True, corrected=True, no_evidence=False)
         return corrected
 
     def run(self, question: str) -> str:
@@ -289,6 +305,7 @@ class Orchestrator:
         retried = False
 
         self._log("QUESTION", question)
+        self._emit("question", text=question)
 
         for step in range(self.cfg.max_steps):
             self._log(f"STEP {step} - PROMPT SENT", "\n".join(m.text for m in messages))
@@ -297,10 +314,12 @@ class Orchestrator:
                 max_new_tokens=self.cfg.decision_max_new_tokens,
             )
             self._log(f"STEP {step} - RAW OUTPUT", output)
+            self._emit("decision", step=step, raw=output)
 
             query = extract_search(output)
             if query is None and is_ready(output):
                 self._log(f"STEP {step} - READY", "model declared evidence sufficient")
+                self._emit("ready", step=step)
                 messages.append(Message(role="assistant", text="READY"))
                 if images_used:
                     return self._generate_final(messages, question, retrieved_evidence)
@@ -312,20 +331,24 @@ class Orchestrator:
                         f"STEP {step} - INVALID DECISION",
                         "requesting exactly one SEARCH or READY",
                     )
+                    self._emit("invalid_decision", step=step, raw=output)
                     messages.append(Message(role="assistant", text=output))
                     messages.append(Message(role="user", text=RETRY_INSTRUCTION))
                     continue
 
                 self._log(f"STEP {step} - DECISION RETRY FAILED", output)
+                self._emit("decision_failed", step=step, raw=output)
                 if images_used:
                     return self._generate_final(messages, question, retrieved_evidence)
                 return output
 
             self._log(f"STEP {step} - EXTRACTED TRIGGER", query)
+            self._emit("search", step=step, query=query)
 
             budget = self.cfg.max_images_in_context - images_used
             if budget <= 0:
                 self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
+                self._emit("limit", step=step, reason="image_limit")
                 return self._generate_final(messages, question, retrieved_evidence)
 
             hits = self.retriever.search(query, k=min(self.top_k, budget))
@@ -358,6 +381,12 @@ class Orchestrator:
                     f"STEP {step} - DUPLICATE HITS",
                     f"{existing_labels} already in context; no new label assigned",
                 )
+                self._emit(
+                    "duplicate",
+                    step=step,
+                    labels=sorted(set(duplicate_labels)),
+                    new_evidence=bool(new_hits),
+                )
 
             if duplicate_labels and not new_hits:
                 feedback = DUPLICATE_RESULT_INSTRUCTION.format(
@@ -371,10 +400,26 @@ class Orchestrator:
             first_label = images_used + 1
             messages.append(self._results_message(new_hits, first_label, question))
             images_used += len(new_hits)
+            self._emit(
+                "retrieval",
+                step=step,
+                hits=[
+                    {
+                        "label": first_label + offset,
+                        "id": hit.id,
+                        "score": hit.score,
+                        "image_path": str(hit.image_path),
+                        "caption": hit.caption,
+                    }
+                    for offset, hit in enumerate(new_hits)
+                ],
+            )
 
             if images_used >= self.cfg.max_images_in_context:
                 self._log(f"STEP {step} - IMAGE LIMIT", "forcing final answer")
+                self._emit("limit", step=step, reason="image_limit")
                 return self._generate_final(messages, question, retrieved_evidence)
 
         self._log("STEP LIMIT", "forcing final answer")
+        self._emit("limit", step=self.cfg.max_steps, reason="step_limit")
         return self._generate_final(messages, question, retrieved_evidence)

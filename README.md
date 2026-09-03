@@ -93,6 +93,50 @@ python main.py --config configs/windows-cuda.yaml "What does the Colosseum in Ro
 Each run shows the loop steps in the terminal and saves the complete log
 in `logs/`.
 
+## Demo UI (presentation)
+
+The demo compares the same frozen model **with and without** the agentic loop,
+side by side, in the browser.
+
+How to test it (after the installation steps above and `scripts/build_index.py`):
+
+```bash
+python app.py
+```
+
+On Windows:
+
+```powershell
+python app.py --config configs/windows-cuda.yaml
+```
+
+1. Wait for `Running on local URL: http://127.0.0.1:7860` in the terminal —
+   the server does not open the browser by itself and prints nothing else
+   until you use it. Open that address manually.
+2. Type a question about one of the dataset landmarks (see
+   `data/metadata.jsonl` for what the index contains), for example:
+   *"Describe the visible shape of the Sydney Opera House roof."* or
+   *"Compare the visible architecture of the Colosseum in Rome and the
+   Sydney Opera House."*
+3. Click **Run both**. The left column answers first (model alone, no
+   retrieval, ~1 s). Then the right column streams the agentic loop one event
+   at a time: model decision, retrieval with thumbnail and CLIP score, the
+   orchestrator guard when a duplicate search is blocked (amber), READY
+   (green), the citation validator, and the final answer with highlighted
+   `(Image N)` citations. A full loop takes ~5–10 s on an M-series Mac.
+4. The answer is always shown exactly as generated: a red badge means the
+   citation validation failed (known Qwen2-VL-2B limit), nothing is patched.
+
+Troubleshooting:
+
+- `Cannot find empty port`: another instance is running — close it or use
+  `python app.py --port 7861`.
+- If streaming misbehaves on your backend, `--no-thread` runs the loop
+  synchronously and shows the full timeline at the end (same result).
+- Every run also appends the raw prompts to `logs/run_*.log` and the
+  structured events to `logs/events_*.jsonl` (useful as a replay/backup
+  during the presentation).
+
 ## Optional LMM-only test
 
 ```bash
@@ -108,6 +152,7 @@ python scripts/test_lmm.py --config configs/windows-cuda.yaml
 ## Main structure
 
 - `main.py`: entry point
+- `app.py`: Gradio demo UI (model alone vs agentic loop timeline)
 - `src/lmm.py`: multimodal model through MLX or Transformers/CUDA
 - `src/retriever.py`: retrieval with CLIP and FAISS
 - `src/orchestrator.py`: agentic loop

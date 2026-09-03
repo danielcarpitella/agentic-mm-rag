@@ -114,6 +114,12 @@ model turn, then returns the result to the model for a new decision. Extra
 - Retrieved IDs already present in the context are not assigned another `Image N`
   label and do not consume the image budget. The model receives explicit duplicate
   feedback and makes a new decision; the attempted action still consumes one step.
+- Observability: the orchestrator accepts an optional `on_event` callback and
+  emits one typed dict per meaningful moment (`question`, `decision`, `search`,
+  `retrieval`, `duplicate`, `ready`, `limit`, `final_prompt`, `invalid_answer`,
+  `answer`, ...). It mirrors what the text log already records and never changes
+  the loop. `app.py` consumes this stream to render the demo timeline; a future
+  `thinking` step would be one more event type, nothing else.
 
 
 
@@ -260,6 +266,7 @@ automatically transforms it into the necessary tokens.
 | `src/retriever.py`              | Encodes the query with CLIP and retrieves items from the index.         |
 | `src/orchestrator.py`           | Intercepts the trigger, coordinates retrieval and context updates.     |
 | `main.py`                       | Command-line entry point.                                               |
+| `app.py`                        | Gradio demo UI: model-alone answer beside the streamed agent timeline.  |
 
 
 

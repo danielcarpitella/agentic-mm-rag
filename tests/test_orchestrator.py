@@ -101,6 +101,76 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotIn("already available as Image 1", final_text)
         self.assertNotIn('SEARCH("', final_text)
 
+    def test_on_event_hook_reports_the_loop_sequence_without_changing_it(self) -> None:
+        lmm = FakeLMM(
+            [
+                'SEARCH("Sydney Opera House roof")',
+                'SEARCH("roof of the Sydney Opera House")',
+                "READY.",
+                "The roof has curved sail-like shells (Image 1).",
+            ]
+        )
+        retriever = FakeRetriever(self.hit)
+        cfg = OrchestratorConfig(
+            max_steps=4,
+            max_images_in_context=4,
+            decision_max_new_tokens=48,
+        )
+        events: list[dict] = []
+
+        with TemporaryDirectory() as log_dir:
+            with redirect_stdout(StringIO()):
+                answer = Orchestrator(
+                    lmm, retriever, cfg, top_k=1, log_dir=log_dir, on_event=events.append
+                ).run("Describe the roof.")
+
+        # Same behaviour as without the hook.
+        self.assertEqual(answer, "The roof has curved sail-like shells (Image 1).")
+        self.assertEqual(len(retriever.queries), 2)
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "question",
+                "decision",
+                "search",
+                "retrieval",
+                "decision",
+                "search",
+                "duplicate",
+                "decision",
+                "ready",
+                "final_prompt",
+                "answer",
+            ],
+        )
+        retrieval = events[3]
+        self.assertEqual(retrieval["step"], 0)
+        self.assertEqual(
+            retrieval["hits"],
+            [
+                {
+                    "label": 1,
+                    "id": "sydney_opera_house",
+                    "score": 0.9,
+                    "image_path": "data/images/sydney_opera_house.jpg",
+                    "caption": self.hit.caption,
+                }
+            ],
+        )
+        self.assertEqual(events[6], {"type": "duplicate", "step": 1, "labels": [1], "new_evidence": False})
+        self.assertEqual(events[9], {"type": "final_prompt", "labels": [1]})
+        self.assertEqual(
+            events[10],
+            {
+                "type": "answer",
+                "text": answer,
+                "valid": True,
+                "corrected": False,
+                "no_evidence": False,
+            },
+        )
+
     def test_duplicate_attempts_consume_steps_and_reach_step_limit(self) -> None:
         lmm = FakeLMM(
             [
